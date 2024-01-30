@@ -152,6 +152,7 @@ public class GcloudClient {
                 InputStream jsonStream = new FileInputStream(credentialsFile);
                 credential = GoogleCredentials.fromStream(jsonStream);
             } else {
+                log.info("Get application default Service Account since cannot access credential file");
                 credential = GoogleCredentials.getApplicationDefault();
             }
             if (credential.createScopedRequired()) {
@@ -475,16 +476,38 @@ public class GcloudClient {
 
     /**
      *
-     * @Title: getServiceAccount
-     * @Description: Get service account setting
-     * @param t
+     * @Title: getInstanceServiceAccount
+     * @Description: Set service account that is assigned to bursted instances
+     * @param t: template
      * @param projectId
-     * @return
+     * @return   a) null, means that If "launchTemplateId" is defined in template, and ASSIGN_SERVICE_ACCOUNT_FROM_LAUNCH_TEMPLATE is set to true in config.json
+     *              Assign the "ServiceAccount" inside the "InstanceTemplate" to created instances.
+     *           b) "Default", assign "Default" Service Account to created instances, with permission compute and storage.
      */
-    public static ServiceAccount getServiceAccount(GcloudTemplate t, String projectId) {
+    public static ServiceAccount getInstanceServiceAccount(GcloudTemplate t, String projectId) {
         // Initialize the service account to be used by the VM Instance
         // and set the API access scopes.
+    	String launchTemplateId = t.getLaunchTemplateId();
+    	
+    	
+    	 // launchTempalteId is defined, and ASSIGN_SERVICE_ACCOUNT_FROM_LAUNCH_TEMPLATE is enabled
+        if (StringUtils.isNotEmpty(launchTemplateId) && 
+        		GcloudUtil.isAssignInstTemplateServiceAccount()) {
+        	 // launchTemplateId is defined, and serviceAccount is defined to "launcheTemplate"
+        	 // Do nothing, so that it use the "ServiceAccount" in launchTemplate
+        	log.debug("Use Service Account inside the Instance Template " + launchTemplateId);
+        	return null;
+        }
+        
         ServiceAccount account = new ServiceAccount();
+        if (StringUtils.isEmpty(launchTemplateId) && 
+        		GcloudUtil.isAssignInstTemplateServiceAccount()) {
+        	log.debug("ASSIGN_SERVICE_ACCOUNT_FROM_LAUNCH_TEMPLATE is enabled, but 'launchTemplateId' is not defined in template " 
+        		+ t.getTemplateId() + ", Use 'default' Service Account.");
+        } else {
+        	log.debug("Assign 'default' Service Account to created instances.");
+        }
+
         account.setEmail("default");
         List<String> scopes = new ArrayList<String>();
         scopes.add("https://www.googleapis.com/auth/devstorage.full_control");
@@ -492,6 +515,7 @@ public class GcloudClient {
         account.setScopes(scopes);
 
         return account;
+   
     }
 
 
@@ -573,8 +597,10 @@ public class GcloudClient {
 
         // Initialize the service account to be used by the VM Instance
         // and set the API access scopes.
-        ServiceAccount account = getServiceAccount(t, projectId);
-        instance.setServiceAccounts(Collections.singletonList(account));
+        ServiceAccount account = getInstanceServiceAccount(t, projectId);
+        if (account != null) {
+        	instance.setServiceAccounts(Collections.singletonList(account));
+        }
 
         // Optional - Add a startup script to be used by the VM
         // Instance.
@@ -643,8 +669,10 @@ public class GcloudClient {
 
         // Initialize the service account to be used by the VM Instance
         // and set the API access scopes.
-        ServiceAccount account = getServiceAccount(t, projectId);
-        instanceProperties.setServiceAccounts(Collections.singletonList(account));
+        ServiceAccount account = getInstanceServiceAccount(t, projectId);
+        if (account != null) {
+        	instanceProperties.setServiceAccounts(Collections.singletonList(account));
+        }
 
         // Optional - Add a startup script to be used by the VM
         // Instance.
@@ -1119,6 +1147,12 @@ public class GcloudClient {
         }
         String projectId = GcloudUtil.getConfig().getProjectID();
         GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
+        if (at == null) {
+            String ebrokerdRequestStatus = GcloudConst.EBROKERD_STATE_COMPLETE_WITH_ERROR;
+            req.setStatus(ebrokerdRequestStatus);
+            log.warn("Failed to get template " + req.getTemplateId());
+            return;
+        }
         Compute compute = getClient();
         String bulkOperationId = req.getReqId();
         String opStatus = null;
@@ -1193,18 +1227,27 @@ public class GcloudClient {
      * @return
      */
     public static Map<String, Instance> updateBulkVMList(GcloudRequest req, GcloudEntity rsp) {
-        Map<String, Instance> vmMap = new HashMap<String, Instance>();
-        List<GcloudMachine> newMachinesList = new ArrayList<GcloudMachine>();
-        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
-        String templateId = at.getTemplateId();
-        String bulkRequestId = req.getReqId();
-        String bulkInsertId = req.getBulkInsertId();
-        String rcAccount = req.getTagValue();
-        Map<String, Instance> gcloudVMMap = new HashMap<String, Instance>();
-
         if (log.isDebugEnabled()) {
             log.debug("Start in class GcloudClient in method updateBulkVMList with parameters: GcloudRequest: " + req);
         }
+
+        String bulkRequestId = req.getReqId();
+        String bulkInsertId = req.getBulkInsertId();
+        String rcAccount = req.getTagValue();
+        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
+        /* lsf-L3-tracker#875 avoid null pointer if this templateId is removed from googleprov_tempalates.json */
+        if (at == null) {
+            String ebrokerdRequestStatus = GcloudConst.EBROKERD_STATE_COMPLETE_WITH_ERROR;
+            req.setStatus(ebrokerdRequestStatus);
+            log.warn("Failed to get template " + req.getTemplateId());
+            return null;
+        }
+        String templateId = at.getTemplateId();
+
+        
+        Map<String, Instance> gcloudVMMap = new HashMap<String, Instance>();
+        Map<String, Instance> vmMap = new HashMap<String, Instance>();
+        List<GcloudMachine> newMachinesList = new ArrayList<GcloudMachine>();
 
         // Update bulkInsert Operation status
         updateBulkRequestStatus(req, rsp);
@@ -1221,6 +1264,10 @@ public class GcloudClient {
             instances = getZonalBulkInstances(req, rsp);
         } else if (HostAllocationType.RegionalBulk.toString().equals(req.getHostAllocationType())) {
             instances = getRegionalBulkInstances(req, rsp);
+        }
+
+        if (instances == null || instances.isEmpty()) {
+            return null;
         }
 
         for (Instance instance : instances) {
@@ -1320,19 +1367,25 @@ public class GcloudClient {
      * @return
      */
     public static List<Instance> getZonalBulkInstances(GcloudRequest req, GcloudEntity rsp) {
-        Compute compute = getClient();
         String projectId = GcloudUtil.getConfig().getProjectID();
-        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
-        String zone = at.getZone();
         String bulkRequestId = req.getReqId();
         String bulkInsertId = req.getBulkInsertId();
         List<Instance> instances = new ArrayList<Instance>();
         InstanceList response = null;
-
+        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
+        if (at == null) {
+            String ebrokerdRequestStatus = GcloudConst.EBROKERD_STATE_COMPLETE_WITH_ERROR;
+            req.setStatus(ebrokerdRequestStatus);
+            log.warn("Failed to get template " + req.getTemplateId());
+            return instances;
+        }
+        String zone = at.getZone();
         if (log.isTraceEnabled()) {
             log.trace("Start in class GcloudClient in method getZonalBulkInstances, zone: " + zone );
         }
 
+
+        Compute compute = getClient();
         // Using label bulk_id = bulkInsertId to filter instances created by this bulk request
         String filterStr = "labels." + GcloudConst.BULK_INSERT_LABEL_KEY + "=" + bulkInsertId ;
         log.debug("Bulk filter string: " + filterStr);
@@ -1371,16 +1424,22 @@ public class GcloudClient {
      * @return
      */
     public static List<Instance> getRegionalBulkInstances (GcloudRequest req, GcloudEntity rsp) {
-        String projectId = GcloudUtil.getConfig().getProjectID();
-        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
         String bulkRequestId = req.getReqId();
         String bulkInsertId = req.getBulkInsertId();
+        String projectId = GcloudUtil.getConfig().getProjectID();
+        List<Instance> instances = new ArrayList<Instance>();
+        GcloudTemplate at = GcloudUtil.getTemplateFromFile(req.getTemplateId());
+        if (at == null) {
+            String ebrokerdRequestStatus = GcloudConst.EBROKERD_STATE_COMPLETE_WITH_ERROR;
+            req.setStatus(ebrokerdRequestStatus);
+            log.warn("Failed to get template " + req.getTemplateId());
+            return instances;
+        }
         String region = (StringUtils.isNotEmpty(at.getRegion())) ? at.getRegion() : GcloudUtil.getConfig().getGcloudRegion();
-        List<Instance> instances = null;
-
         if (log.isTraceEnabled()) {
             log.trace("Start in class GcloudClient in method getRegionalBulkInstances, region: " + region);
         }
+
 
         // Using label bulk_id = bulkInsertId to filter instances created by this bulk request
         String filterStr = "labels." + GcloudConst.BULK_INSERT_LABEL_KEY + "=" + bulkInsertId ;
