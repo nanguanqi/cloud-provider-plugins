@@ -172,6 +172,15 @@ public class GcloudImpl implements IGcloud {
         // load information from DB and Google cloud
         GcloudEntity provisionStatusDB = GcloudUtil.getFromFile();
         Map<String, Instance> instances = GcloudClient.getCloudVMMap();
+        
+        /* lsf-L3-tracker#736 do not reclaim host if list all instances from cloud fail */
+        if (instances == null || instances.isEmpty()) {
+            rsp.setStatus(GcloudConst.EBROKERD_STATE_COMPLETE);
+            rsp.setReqs(gcloudRequestList);
+            rsp.setRsp(0, "Failed to list instances on Google Cloud");
+            log.warn("getReturnRequests failed because of failing to list instances on Google Cloud.");
+            return rsp; 
+        }
 
         List<GcloudRequest> requestsToBeChecked = new ArrayList<GcloudRequest>();
         if (provisionStatusDB != null && !CollectionUtils.isEmpty(provisionStatusDB.getReqs())) {
@@ -261,6 +270,7 @@ public class GcloudImpl implements IGcloud {
                 if (CollectionUtils.isEmpty(mList)) {
                     if (GcloudUtil.isBulkRequest(requestInDB.getHostAllocationType())) {
                         GcloudClient.updateBulkVMList(requestInDB, rsp);
+                        log.debug("Bulk request status: " + requestInDB);
                         if (requestInDB.getStatus() != null
                                 && (requestInDB.getStatus().equals(GcloudConst.EBROKERD_STATE_COMPLETE)
                                     || requestInDB.getStatus().equals(GcloudConst.EBROKERD_STATE_COMPLETE_WITH_ERROR))
@@ -647,7 +657,7 @@ public class GcloudImpl implements IGcloud {
             if (GcloudUtil.isBulkRequest(fReq.getHostAllocationType())
                     && statusUpdateForCreateMachine) {
                 vmMap = GcloudClient.updateBulkVMList(fReq, rsp);
-                if (vmMap == null) {
+                if (vmMap == null || vmMap.isEmpty()) {
                     return;
                 }
                 machinesListInDB = fReq.getMachines();
@@ -861,7 +871,7 @@ public class GcloudImpl implements IGcloud {
                         if (matchingMachine != null) {
                             log.trace("Value of machine in updateVm before updating attributes: " + machineInDB);
                             machineInDB.copyValues(matchingMachine);
-                            log.trace("Value of machine in updateVm before updating attributes: " + machineInDB);
+                            log.trace("Value of machine in updateVm after updating attributes: " + machineInDB);
                             // Remove the current machine from the update
                             // machine list since its values are copied to the
                             // DB object
